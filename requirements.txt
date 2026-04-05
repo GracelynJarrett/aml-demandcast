@@ -5,3 +5,5 @@ mlflow
 streamlit
 pyarrow
 optuna
+
+# Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
