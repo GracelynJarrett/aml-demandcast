@@ -6,6 +6,7 @@ python build_features.py
 """
 
 from pathlib import Path
+import os
 
 import pandas as pd
 
@@ -18,14 +19,21 @@ from src.features_skeleton import (
 
 
 def build_features(
-	input_path: Path,
+	input_path: Path | list[Path],
 	output_path: Path,
 	drop_lag_nans: bool = True,
+	clip_to_dominant_month: bool = True,
 ) -> pd.DataFrame:
 	"""Run the full feature pipeline and save output parquet."""
-	df = pd.read_parquet(input_path)
+	if isinstance(input_path, list):
+		if not input_path:
+			raise FileNotFoundError("No raw data files were provided.")
+		raw_parts = [pd.read_parquet(path) for path in input_path]
+		df = pd.concat(raw_parts, ignore_index=True)
+	else:
+		df = pd.read_parquet(input_path)
 
-	cleaned = clean_data(df)
+	cleaned = clean_data(df, clip_to_dominant_month=clip_to_dominant_month)
 	temporal = create_temporal_features(cleaned)
 	hourly = aggregate_to_hourly_demand(temporal)
 	hourly = hourly.sort_values(["PULocationID", "hour"]).reset_index(drop=True)
@@ -43,13 +51,41 @@ def build_features(
 
 def main() -> None:
 	project_root = Path(__file__).resolve().parent
-	input_path = project_root / "data" / "yellow_tripdata_2025-01.parquet"
+	data_dir = project_root / "data"
+	input_path = data_dir / "yellow_tripdata_2025-01.parquet"
 	output_path = project_root / "data" / "features.parquet"
+	build_all_2025_months = os.getenv("BUILD_ALL_2025_MONTHS", "0") == "1"
+	clip_to_dominant_month = os.getenv("CLIP_TO_DOMINANT_MONTH", "1") == "1"
 
-	if not input_path.exists():
-		raise FileNotFoundError(f"Raw data not found: {input_path}")
+	selected_input: Path | list[Path]
+	if build_all_2025_months:
+		selected_input = sorted(data_dir.glob("yellow_tripdata_2025-*.parquet"))
+	else:
+		selected_input = input_path
 
-	feature_df = build_features(input_path=input_path, output_path=output_path)
+	if isinstance(selected_input, list):
+		if not selected_input:
+			raise FileNotFoundError(
+				f"No files matching yellow_tripdata_2025-*.parquet found in {data_dir}"
+			)
+	else:
+		if not selected_input.exists():
+			raise FileNotFoundError(f"Raw data not found: {selected_input}")
+
+	feature_df = build_features(
+		input_path=selected_input,
+		output_path=output_path,
+		clip_to_dominant_month=clip_to_dominant_month,
+	)
+
+	if isinstance(selected_input, list):
+		print("Input files:")
+		for path in selected_input:
+			print(f" - {path.name}")
+	else:
+		print(f"Input file: {selected_input.name}")
+	print(f"build_all_2025_months={build_all_2025_months}")
+	print(f"clip_to_dominant_month={clip_to_dominant_month}")
 	print(f"Saved features: {output_path}")
 	print(f"Output shape: {feature_df.shape}")
 	print(f"Columns: {feature_df.columns.tolist()}")
