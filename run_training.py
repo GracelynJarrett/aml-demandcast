@@ -1,7 +1,7 @@
 """Run the required Part 2 model training experiments.
 
 This script calls src.train_skeleton.train_and_log() for three models and logs
-all runs to the DemandCast MLflow experiment.
+all runs to the DemandCast_RandomSplits MLflow experiment.
 """
 
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor

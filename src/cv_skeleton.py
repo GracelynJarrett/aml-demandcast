@@ -42,6 +42,7 @@ time_series_cv    Run n-fold time-series CV on one model. Log per-fold metrics
 """
 
 from pathlib import Path
+import os
 
 import mlflow
 import mlflow.sklearn
@@ -64,10 +65,21 @@ except ModuleNotFoundError:
 # ---------------------------------------------------------------------------
 
 MLFLOW_TRACKING_URI = "http://localhost:5000"
-EXPERIMENT_NAME     = "DemandCast"
+EXPERIMENT_NAME     = os.getenv("MLFLOW_EXPERIMENT_NAME_CV", os.getenv("MLFLOW_EXPERIMENT_NAME", "DemandCast_RandomSplits"))
 
 DATA_PATH   = Path(__file__).resolve().parents[1] / "data" / "features.parquet"
 TRAINVAL_CUTOFF = "2025-02-01"   # CV runs only on train+val — test set stays sealed
+
+# Split mode options:
+#   "date" (default) — chronological split by cutoff dates
+#   "percentage" — chronological percentage split (no shuffling)
+#   "random" — random shuffle then time-series split
+SPLIT_METHOD = os.getenv("SPLIT_METHOD", "date").lower()
+TRAIN_RATIO = float(os.getenv("TRAIN_RATIO", "0.50"))
+VAL_RATIO = float(os.getenv("VAL_RATIO", "0.30"))
+TEST_RATIO = float(os.getenv("TEST_RATIO", "0.20"))
+TRAINVAL_RATIO = TRAIN_RATIO + VAL_RATIO
+RANDOM_SEED = int(os.getenv("RANDOM_SEED", "42"))
 TARGET      = "demand"
 
 

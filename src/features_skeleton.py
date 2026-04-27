@@ -36,6 +36,9 @@ FEATURE_COLS: list[str] = [
     "day_of_week",
     "is_weekend",
     "is_rush_hour",
+    "demand_lag_1h",
+    "demand_lag_24h",
+    "demand_lag_168h",
 ]
 
 
@@ -44,7 +47,7 @@ FEATURE_COLS: list[str] = [
 # ---------------------------------------------------------------------------
 
 # AI prompt used: "Implement clean_data based on EDA with datetime parsing, month-boundary clipping, missing-value handling, and reusable outlier filters."
-def clean_data(df: pd.DataFrame) -> pd.DataFrame:
+def clean_data(df: pd.DataFrame, clip_to_dominant_month: bool = True) -> pd.DataFrame:
     """Clean raw trip-level rows before feature engineering.
 
     Use thresholds determined during EDA (notebooks/02_eda_skeleton.ipynb). The defaults below are reasonable
@@ -84,7 +87,8 @@ def clean_data(df: pd.DataFrame) -> pd.DataFrame:
             cleaned[dt_col] = pd.to_datetime(cleaned[dt_col], errors="coerce")
 
     # Keep trips fully inside the dominant pickup month to avoid boundary leakage.
-    if {"tpep_pickup_datetime", "tpep_dropoff_datetime"}.issubset(cleaned.columns):
+    # Disable this for multi-month experiments by passing clip_to_dominant_month=False.
+    if clip_to_dominant_month and {"tpep_pickup_datetime", "tpep_dropoff_datetime"}.issubset(cleaned.columns):
         pickup_month = cleaned["tpep_pickup_datetime"].dt.to_period("M")
         dominant_month = pickup_month.mode(dropna=True)
         if len(dominant_month) > 0:

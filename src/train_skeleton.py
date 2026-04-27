@@ -26,6 +26,7 @@ train_and_log     Load data, split, train one model, log everything to MLflow.
 """
 
 from pathlib import Path
+import os
 
 import mlflow
 import mlflow.sklearn
@@ -48,7 +49,7 @@ except ModuleNotFoundError:
 # ---------------------------------------------------------------------------
 
 MLFLOW_TRACKING_URI = "http://localhost:5000"
-EXPERIMENT_NAME     = "DemandCast"
+EXPERIMENT_NAME     = os.getenv("MLFLOW_EXPERIMENT_NAME", "DemandCast_RandomSplits")
 
 DATA_PATH = Path(__file__).resolve().parents[1] / "data" / "features.parquet"
 
@@ -60,7 +61,34 @@ VAL_CUTOFF  = "2025-01-22"
 TEST_CUTOFF = "2025-02-01"
 TEST_END    = "2025-02-08"
 
+# Split mode options:
+#   "date" (default) — chronological split by cutoff dates
+#   "percentage" — chronological percentage split (no shuffling)
+#   "random" — random shuffle then split by percentages
+SPLIT_METHOD = os.getenv("SPLIT_METHOD", "date").lower()
+TRAIN_RATIO = float(os.getenv("TRAIN_RATIO", "0.50"))
+VAL_RATIO = float(os.getenv("VAL_RATIO", "0.30"))
+TEST_RATIO = float(os.getenv("TEST_RATIO", "0.20"))
+RANDOM_SEED = int(os.getenv("RANDOM_SEED", "42"))
+
 TARGET = "demand"
+
+
+def _split_indices_by_ratio(n_rows: int) -> tuple[int, int]:
+    """Return (train_end_idx, val_end_idx) for chronological percentage splits."""
+    if n_rows < 3:
+        raise ValueError("Need at least 3 rows to create train/val/test splits.")
+
+    ratio_sum = TRAIN_RATIO + VAL_RATIO + TEST_RATIO
+    if not np.isclose(ratio_sum, 1.0):
+        raise ValueError(f"Split ratios must sum to 1.0, got {ratio_sum:.4f}.")
+
+    train_end = int(n_rows * TRAIN_RATIO)
+    val_end = train_end + int(n_rows * VAL_RATIO)
+
+    train_end = max(1, min(train_end, n_rows - 2))
+    val_end = max(train_end + 1, min(val_end, n_rows - 1))
+    return train_end, val_end
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +124,40 @@ def evaluate(y_true: pd.Series, y_pred: np.ndarray) -> dict[str, float]:
         "rmse": round(root_mean_squared_error(y_true, y_pred), 4), # Square roots the error before averagring ( 4->16) -> Lower is better
         "r2":   round(r2_score(y_true, y_pred), 4), # How much cariance is demand is explained by the modesl -> Higher is better
     }
+
+
+def evaluate_mape_mbe(y_true: pd.Series, y_pred: np.ndarray) -> dict[str, float]:
+    """Compute MAPE and MBE with zero-demand-safe MAPE handling.
+
+    MAPE excludes rows where y_true == 0 to avoid division-by-zero.
+    Additional diagnostics are returned so this behavior is transparent.
+    """
+    y_true_arr = np.asarray(y_true, dtype=float)
+    y_pred_arr = np.asarray(y_pred, dtype=float)
+
+    if y_true_arr.size == 0:
+        raise ValueError("Cannot evaluate metrics on an empty validation set.")
+
+    nonzero_mask = y_true_arr != 0
+    included_rows = int(nonzero_mask.sum())
+    excluded_rows = int((~nonzero_mask).sum())
+    excluded_pct = round((excluded_rows / y_true_arr.size) * 100.0, 4)
+
+    mbe = round(float(np.mean(y_pred_arr - y_true_arr)), 4)
+
+    metrics: dict[str, float] = {
+        "mbe": mbe,
+        "mape_excluded_rows": float(excluded_rows),
+        "mape_excluded_pct": excluded_pct,
+    }
+
+    if included_rows > 0:
+        mape = np.mean(
+            np.abs((y_true_arr[nonzero_mask] - y_pred_arr[nonzero_mask]) / y_true_arr[nonzero_mask])
+        ) * 100.0
+        metrics["mape"] = round(float(mape), 4)
+
+    return metrics
 
 
 # ---------------------------------------------------------------------------
@@ -204,11 +266,31 @@ def train_and_log(
         is_rush = split_ts.dt.hour.isin([7, 8, 17, 18])
         df["is_rush_hour"] = (is_weekday & is_rush).astype(int)
 
-    # FEATURE_COLS expects hour-of-day, so convert timestamp to numeric hour for modeling.
-    df["hour"] = split_ts.dt.hour
+    split_method = SPLIT_METHOD.lower()
+    if split_method == "random":
+        # Shuffle data randomly, then split by percentages
+        df = df.sample(frac=1.0, random_state=RANDOM_SEED).reset_index(drop=True)
+        train_end, val_end = _split_indices_by_ratio(len(df))
+        train = df.iloc[:train_end].copy()
+        val = df.iloc[train_end:val_end].copy()
+    elif split_method == "percentage":
+        # Chronological percentage split (no shuffling)
+        sort_cols = ["hour"]
+        if "PULocationID" in df.columns:
+            sort_cols = ["hour", "PULocationID"]
+        df = df.sort_values(sort_cols).reset_index(drop=True)
 
-    train = df[split_ts < VAL_CUTOFF]
-    val = df[(split_ts >= VAL_CUTOFF) & (split_ts < TEST_CUTOFF)]
+        train_end, val_end = _split_indices_by_ratio(len(df))
+        train = df.iloc[:train_end].copy()
+        val = df.iloc[train_end:val_end].copy()
+    else:
+        # Date-based split (original behavior)
+        train = df[split_ts < VAL_CUTOFF].copy()
+        val = df[(split_ts >= VAL_CUTOFF) & (split_ts < TEST_CUTOFF)].copy()
+
+    # FEATURE_COLS expects hour-of-day, so convert timestamp to numeric hour for modeling.
+    train["hour"] = pd.to_datetime(train["hour"], errors="coerce").dt.hour
+    val["hour"] = pd.to_datetime(val["hour"], errors="coerce").dt.hour
 
     if train.empty:
         raise ValueError("Training split is empty. Check VAL_CUTOFF and input data range.")
@@ -228,17 +310,42 @@ def train_and_log(
     mlflow.set_experiment(EXPERIMENT_NAME)
 
     with mlflow.start_run(run_name=run_name) as run:
+        mlflow.log_param("split_method", split_method)
+        if split_method == "percentage":
+            mlflow.log_param("train_ratio", TRAIN_RATIO)
+            mlflow.log_param("val_ratio", VAL_RATIO)
+            mlflow.log_param("test_ratio", TEST_RATIO)
+        else:
+            mlflow.log_param("val_cutoff", VAL_CUTOFF)
+            mlflow.log_param("test_cutoff", TEST_CUTOFF)
         mlflow.log_params(params)
 
         model.fit(X_train, y_train)
         val_preds = model.predict(X_val)
         val_metrics = evaluate(y_val, val_preds)
+        val_extra_metrics = evaluate_mape_mbe(y_val, val_preds)
 
-        mlflow.log_metrics({f"val_{k}": v for k, v in val_metrics.items()})
+        mlflow_metrics = {f"val_{k}": v for k, v in val_metrics.items()}
+        mlflow_metrics["val_mbe"] = val_extra_metrics["mbe"]
+        mlflow_metrics["val_mape_excluded_rows"] = val_extra_metrics["mape_excluded_rows"]
+        mlflow_metrics["val_mape_excluded_pct"] = val_extra_metrics["mape_excluded_pct"]
+        if "mape" in val_extra_metrics:
+            mlflow_metrics["val_mape"] = val_extra_metrics["mape"]
+
+        mlflow.log_metrics(mlflow_metrics)
         mlflow.sklearn.log_model(model, "model")
+
+        val_mape_display = (
+            f"{val_extra_metrics['mape']:.2f}%"
+            if "mape" in val_extra_metrics
+            else "N/A (all val demand values were zero)"
+        )
 
         print(
             f"[{run_name}] val_mae={val_metrics['mae']:.2f}  "
-            f"val_rmse={val_metrics['rmse']:.2f}  val_r2={val_metrics['r2']:.3f}"
+            f"val_rmse={val_metrics['rmse']:.2f}  "
+            f"val_r2={val_metrics['r2']:.3f}  "
+            f"val_mape={val_mape_display}  "
+            f"val_mbe={val_extra_metrics['mbe']:.2f}"
         )
         return run.info.run_id
