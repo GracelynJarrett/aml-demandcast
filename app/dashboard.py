@@ -8,6 +8,8 @@ import streamlit as st
 
 MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000")
 MODEL_URI = "models:/DemandCast/Production"
+PINNED_RUN_ID = os.getenv("DEMANDCAST_MODEL_RUN_ID", "d4bb5dd4b0eb42f6b0e84558efcd3699")
+PINNED_MODEL_URI = f"runs:/{PINNED_RUN_ID}/model"
 DATA_PATH = Path(__file__).resolve().parents[1] / "data" / "features.parquet"
 LOCAL_MODEL_ROOT = Path(__file__).resolve().parents[1] / "mlartifacts"
 
@@ -36,8 +38,14 @@ DAY_NAME_TO_NUM = {
 
 @st.cache_resource
 def load_production_model():
-    """Load the current Production model, preferring MLflow registry."""
+    """Load model, preferring a pinned run ID, then Production, then local cache."""
     mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+
+    try:
+        model = mlflow.pyfunc.load_model(PINNED_MODEL_URI)
+        return model, f"Pinned MLflow run {PINNED_RUN_ID}"
+    except Exception:
+        pass
 
     try:
         model = mlflow.pyfunc.load_model(MODEL_URI)
@@ -57,6 +65,26 @@ def load_production_model():
         raise RuntimeError(
             "Could not load the Production model from MLflow or from a local artifact cache."
         )
+
+
+def get_production_model_details() -> str:
+    """Return pinned run plus current Production version and run ID for display."""
+    mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+
+    details = [f"Pinned run target: {PINNED_RUN_ID}"]
+
+    try:
+        client = mlflow.tracking.MlflowClient()
+        versions = client.get_latest_versions("DemandCast", stages=["Production"])
+        if versions:
+            version = versions[0]
+            details.append(f"Production version {version.version} (run {version.run_id})")
+            return " | ".join(details)
+    except Exception:
+        pass
+
+    details.append("Production model metadata unavailable")
+    return " | ".join(details)
 
 
 @st.cache_data
@@ -179,6 +207,14 @@ def main() -> None:
         st.error(f"Could not load reference data from {DATA_PATH}: {exc}")
         st.stop()
 
+    if "PULocationID" in df.columns:
+        pu_options = sorted(df["PULocationID"].dropna().astype(int).unique().tolist())
+    else:
+        pu_options = list(range(1, 266))
+
+    if "selected_pu_location_id" not in st.session_state:
+        st.session_state.selected_pu_location_id = pu_options[0]
+
     # Initialize session state for page selection
     if "current_page" not in st.session_state:
         st.session_state.current_page = "Prediction"
@@ -189,26 +225,29 @@ def main() -> None:
     
     # Update session state based on selection
     st.session_state.current_page = "Prediction" if page == "📊 Prediction" else "About"
+
+    st.sidebar.header("Zone Filter")
+    pu_location_id = st.sidebar.selectbox(
+        "Pickup zone (PULocationID)",
+        pu_options,
+        index=pu_options.index(st.session_state.selected_pu_location_id)
+        if st.session_state.selected_pu_location_id in pu_options
+        else 0,
+        key="selected_pu_location_id",
+    )
     
     st.sidebar.divider()
 
     # Render the appropriate page
     if st.session_state.current_page == "Prediction":
-        render_prediction_page(model, df)
+        render_prediction_page(model, df, pu_location_id)
     else:
-        render_about_page(df, model_source)
+        render_about_page(df, model_source, pu_location_id, get_production_model_details())
 
 
-def render_prediction_page(model, df):
+def render_prediction_page(model, df, pu_location_id):
     """Render the main prediction page."""
     st.sidebar.header("Prediction Inputs")
-
-    if "PULocationID" in df.columns:
-        pu_options = sorted(df["PULocationID"].dropna().astype(int).unique().tolist())
-    else:
-        pu_options = list(range(1, 266))
-
-    pu_location_id = st.sidebar.selectbox("Pickup zone (PULocationID)", pu_options, index=0)
     hour_of_day = st.sidebar.slider("Hour of day", min_value=0, max_value=23, value=8)
     day_name = st.sidebar.selectbox("Day of week", list(DAY_NAME_TO_NUM.keys()), index=0)
 
@@ -235,6 +274,11 @@ def render_prediction_page(model, df):
 
         try:
             pred = float(model.predict(X_input)[0])
+            # store last prediction for later comparison views
+            st.session_state.last_prediction = float(pred)
+            st.session_state.last_prediction_hour = int(hour_of_day)
+            st.session_state.last_prediction_day = str(day_name)
+            st.session_state.last_prediction_zone = int(pu_location_id)
         except Exception as exc:
             st.error(f"Prediction failed: {exc}")
             st.stop()
@@ -244,59 +288,9 @@ def render_prediction_page(model, df):
         with col2:
             st.markdown(f"<h2 style='text-align: center; font-size: 2.5em; margin: 0;'>Predicted demand</h2>", unsafe_allow_html=True)
             st.markdown(f"<h1 style='text-align: center; font-size: 3.5em; margin: 0; color: #1f77b4;'>{pred:.2f} trips</h1>", unsafe_allow_html=True)
+            st.caption(f"Zone {pu_location_id} | {day_name} | {hour_of_day:02d}:00")
 
-        # Add comparison graph: demand distribution filtered by selected zone
-        st.subheader("Training data: Demand comparison for your zone")
-        try:
-            zone_data = df[df["PULocationID"] == pu_location_id].copy() if "PULocationID" in df.columns else df.copy()
-            
-            if not zone_data.empty and {"hour", "day_of_week", "demand"}.issubset(zone_data.columns):
-                # Create pivot table for the selected zone
-                heatmap_data = zone_data.groupby(["day_of_week", "hour"], as_index=False)["demand"].mean()
-                pivot_data = heatmap_data.pivot(index="day_of_week", columns="hour", values="demand")
-                
-                # Map day numbers to names
-                day_num_to_name = {v: k for k, v in DAY_NAME_TO_NUM.items()}
-                pivot_data.index = pivot_data.index.map(day_num_to_name)
-                
-                # Add prediction row for comparison
-                pred_row = pd.Series({h: pred if h == hour_of_day else None for h in pivot_data.columns}, name=day_name)
-                pivot_with_pred = pd.concat([pivot_data, pred_row.to_frame().T])
-                
-                # Style: highlight max in green, prediction in blue
-                def highlight_cells(val):
-                    if pd.isna(val):
-                        return ''
-                    if val == pred:
-                        return 'background-color: #87CEEB; font-weight: bold'
-                    elif val == pivot_data.values.max():
-                        return 'background-color: #90EE90'
-                    return ''
-                
-                st.dataframe(
-                    pivot_with_pred.style.applymap(highlight_cells).format("{:.1f}", na_rep="–"),
-                    use_container_width=True
-                )
-            else:
-                # Fallback: show demand by hour only with axis labels
-                if "hour" in df.columns and "demand" in df.columns:
-                    hourly_data = df.copy()
-                    hourly_data["hour"] = pd.to_datetime(hourly_data["hour"], errors="coerce")
-                    hourly_data["hour_of_day"] = hourly_data["hour"].dt.hour
-                    hourly_agg = hourly_data.groupby("hour_of_day", as_index=False)["demand"].mean().sort_values("hour_of_day")
-                    hourly_agg["hour_label"] = hourly_agg["hour_of_day"].astype(str) + ":00"
-                    
-                    # Use Altair for better axis labels
-                    chart = alt.Chart(hourly_agg).mark_bar().encode(
-                        x=alt.X('hour_label:N', title='Hour of Day', sort=None),
-                        y=alt.Y('demand:Q', title='Average Demand (trips)')
-                    ).properties(width=700, height=400)
-                    
-                    st.altair_chart(chart, use_container_width=True)
-                else:
-                    st.warning("Could not render comparison chart due to missing columns.")
-        except Exception as e:
-            st.warning(f"Could not render comparison chart: {e}")
+        # training comparison moved to its own section at the bottom of the Prediction page
 
         with st.expander("Show feature vector sent to model"):
             st.dataframe(X_input, use_container_width=True)
@@ -336,13 +330,50 @@ def render_prediction_page(model, df):
         except Exception as e:
             st.warning(f"Could not render day-of-week chart: {e}")
 
+    # Moved from About page: hourly demand chart for the selected zone.
+    pred_val = st.session_state.get("last_prediction", None)
+    pred_zone = st.session_state.get("last_prediction_zone", None)
+    if pred_val is not None and pred_zone == pu_location_id:
+        st.subheader("Average Hourly Demand by Hour of Day")
+        try:
+            zone_data = df[df["PULocationID"] == pu_location_id].copy() if "PULocationID" in df.columns else df.copy()
+            if "hour" in zone_data.columns and "demand" in zone_data.columns:
+                hourly_data = zone_data.copy()
+                hourly_data["hour"] = pd.to_datetime(hourly_data["hour"], errors="coerce")
+                hourly_data = hourly_data[hourly_data["hour"].notna()]
 
-def render_about_page(df, model_source):
+                if not hourly_data.empty:
+                    hourly_data["hour_of_day"] = hourly_data["hour"].dt.hour
+                    hourly_agg = (
+                        hourly_data.groupby("hour_of_day", as_index=False)["demand"]
+                        .mean()
+                        .sort_values("hour_of_day")
+                    )
+                    hourly_agg["hour_label"] = hourly_agg["hour_of_day"].astype(str) + ":00"
+
+                    chart = alt.Chart(hourly_agg).mark_bar().encode(
+                        x=alt.X("hour_label:N", title="Hour of Day", sort=None),
+                        y=alt.Y("demand:Q", title="Average Demand (trips)"),
+                    ).properties(width=700, height=300)
+
+                    st.altair_chart(chart, use_container_width=True)
+                else:
+                    st.info("No valid hourly values available for this zone.")
+            else:
+                st.info("Insufficient data to render hourly demand chart for this zone.")
+        except Exception as e:
+            st.warning(f"Could not render hourly demand chart: {e}")
+    else:
+        st.info("Run a prediction to reveal the average hourly demand chart for this zone.")
+
+def render_about_page(df, model_source, pu_location_id, model_details):
     """Render the About page with metrics explanation and training data info."""
     st.header("Model Status")
     st.markdown(
         f"""
         **Model Source**: {model_source}
+
+        **Model Details**: {model_details}
         
         The DemandCast Production model is loaded from the MLflow Model Registry.
         If MLflow is not available, the dashboard will use a local artifact cache.
@@ -355,8 +386,8 @@ def render_about_page(df, model_source):
     st.subheader("Mean Absolute Error (MAE)")
     st.markdown(
         """
-        - **Value**: ~7.7 trips per zone-hour
-        - **Meaning**: On average, predictions miss by about 7 to 8 trips per pickup zone per hour.
+        - **Value**: ~6.88 trips per zone-hour (tuned run d4bb5dd4...)
+        - **Meaning**: On average, predictions miss by about 6 to 7 trips per pickup zone per hour.
         - **Interpretation**: Use this as a baseline expectation for prediction error in operational planning.
         """
     )
@@ -364,26 +395,26 @@ def render_about_page(df, model_source):
     st.subheader("Mean Absolute Percentage Error (MAPE)")
     st.markdown(
         """
-        - **Value**: ~69%
-        - **Meaning**: Percent error is relatively high, especially unstable for low-demand hours.
-        - **Interpretation**: MAPE is sensitive to zero or near-zero demand values. Use MAE/RMSE instead for planning decisions.
+        - **Value**: 57.794%
+        - **Meaning**: Average percentage error across the evaluation split.
+        - **Interpretation**: Percent error can still be unstable for low-demand hours, so MAE and RMSE remain the better planning metrics.
         """
     )
 
     st.subheader("Mean Bias Error (MBE)")
     st.markdown(
         """
-        - **Value**: ~+0.8 trips
-        - **Meaning**: Slight positive bias means the model tends to over-forecast by about 1 trip on average.
-        - **Interpretation**: The model is slightly optimistic; it may predict slightly higher demand than actual.
+        - **Value**: 0.013367 trips
+        - **Meaning**: The model is essentially unbiased on average.
+        - **Interpretation**: Positive and negative errors are nearly balanced on the evaluation split.
         """
     )
 
     st.subheader("R² (Coefficient of Determination)")
     st.markdown(
         """
-        - **Value**: ~0.95
-        - **Meaning**: The model explains 95% of the variance in demand.
+        - **Value**: ~0.9562 (tuned run d4bb5dd4...)
+        - **Meaning**: The model explains about 95.6% of the variance in demand.
         - **Interpretation**: Strong model performance; captures major hourly and zone-level patterns well.
         """
     )
@@ -391,7 +422,7 @@ def render_about_page(df, model_source):
     st.subheader("Root Mean Squared Error (RMSE)")
     st.markdown(
         """
-        - **Value**: ~17.8 trips
+        - **Value**: ~15.81 trips (tuned run d4bb5dd4...)
         - **Meaning**: Occasional larger misses still happen, especially around peak-demand periods.
         - **Interpretation**: More pessimistic than MAE; use when larger errors are costly.
         """
@@ -402,75 +433,16 @@ def render_about_page(df, model_source):
         """
         **Quick takeaways for operational planning:**
         
-        - **For typical planning**: Use MAE (~7.7 trips) as your margin of error. Most predictions will be within that range.
-        - **For conservative estimates**: Use RMSE (~17.8 trips) if you want to account for occasional larger misses.
-        - **For demand forecasting**: The model is generally reliable (R² = 0.95) and captures major patterns well.
-        - **Be aware**: The model tends to slightly over-forecast by about 1 trip (MBE), so consider this a modest positive bias.
-        - **Avoid**: Don't rely solely on MAPE (~69%) for low-demand hours; use MAE or RMSE instead.
+        - **For typical planning**: Use MAE (~6.88 trips) as your margin of error. Most predictions will be within that range.
+        - **For conservative estimates**: Use RMSE (~15.81 trips) if you want to account for occasional larger misses.
+        - **For demand forecasting**: The tuned model is highly explanatory (R² ≈ 0.956) and captures major patterns well.
+        - **Be aware**: MAPE is still relatively high at 57.794%, so rely on MAE/RMSE for most planning decisions.
+        - **Bias check**: MBE is 0.013367 trips, which is effectively neutral.
+        - **Avoid**: Don't rely solely on MAPE for low-demand hours; prefer MAE or RMSE for planning.
         """
     )
 
-    # Training data distribution
-    st.header("Training Data Distribution")
-    st.markdown(
-        "The charts below show how demand varies across days of the week and hours of the day."
-    )
-
-    try:
-        # Average hourly demand by hour of day
-        st.subheader("Average Hourly Demand by Hour of Day")
-        if "hour" in df.columns and "demand" in df.columns:
-            hourly_data = df.copy()
-            hourly_data["hour"] = pd.to_datetime(hourly_data["hour"], errors="coerce")
-            hourly_data["hour_of_day"] = hourly_data["hour"].dt.hour
-            hourly_avg = hourly_data.groupby("hour_of_day", as_index=False)["demand"].mean().rename(columns={"demand": "avg_demand"}).sort_values("hour_of_day")
-            hourly_avg["hour_label"] = hourly_avg["hour_of_day"].astype(str) + ":00"
-            
-            chart = alt.Chart(hourly_avg).mark_bar().encode(
-                x=alt.X('hour_label:N', title='Hour of Day', sort=None),
-                y=alt.Y('avg_demand:Q', title='Average Demand (trips)')
-            ).properties(width=700, height=300)
-            st.altair_chart(chart, use_container_width=True)
-        else:
-            st.warning("Could not render chart: missing 'hour' or 'demand' columns.")
-
-        # Demand by day of week
-        st.subheader("Average Demand by Day of Week")
-        if "demand" in df.columns and "hour" in df.columns:
-            daily_data = df.copy()
-            # Ensure hour is datetime
-            daily_data["hour"] = pd.to_datetime(daily_data["hour"], errors="coerce")
-            
-            # Drop rows where hour conversion failed
-            daily_data = daily_data[daily_data["hour"].notna()]
-            
-            # Compute day_of_week if missing
-            if "day_of_week" not in daily_data.columns:
-                daily_data["day_of_week"] = daily_data["hour"].dt.dayofweek
-            
-            # Group and aggregate
-            if daily_data["day_of_week"].notna().any():
-                day_avg = daily_data.groupby("day_of_week", as_index=False)["demand"].mean()
-                day_avg = day_avg[day_avg["day_of_week"].notna()].sort_values("day_of_week")
-                
-                day_num_to_name = {v: k for k, v in DAY_NAME_TO_NUM.items()}
-                day_avg["day_name"] = day_avg["day_of_week"].map(day_num_to_name)
-                day_avg = day_avg[["day_of_week", "day_name", "demand"]].rename(columns={"demand": "avg_demand"})
-                
-                if not day_avg.empty:
-                    chart = alt.Chart(day_avg).mark_bar().encode(
-                        x=alt.X("day_name:N", title="Day of Week", sort=list(DAY_NAME_TO_NUM.keys())),
-                        y=alt.Y("avg_demand:Q", title="Average Demand (trips)")
-                    ).properties(width=700, height=300)
-                    st.altair_chart(chart, use_container_width=True)
-                else:
-                    st.warning("No valid day-of-week data available.")
-            else:
-                st.warning("Could not compute day-of-week from hour values.")
-        else:
-            st.warning("Missing 'demand' or 'hour' columns.")
-    except Exception as exc:
-        st.warning(f"Could not load training data visualizations: {exc}")
+    # Training data charts were moved to the Prediction page.
 
     # MLflow link
     st.header("View Full Experiment Results")
